@@ -1,4 +1,4 @@
-# lark-channel-bridge
+﻿# lark-channel-bridge
 
 A lightweight bot that bridges Feishu / Lark messenger with your local Claude Code or Codex CLI. Run one command, scan a QR code to bind a PersonalAgent app, and talk to your local coding agent from chat.
 
@@ -312,8 +312,6 @@ Cloud-doc comments do not need a separate workspace binding or document allowlis
 **The agent says it cannot see an image I sent.** Upgrade to the latest version. Releases before 0.1.0 had a filename-dedup bug.
 **`start` fails on Windows with `ERROR: Access is denied.` / how to run hidden in the background:** On Windows, `start` registers a Task Scheduler task via `schtasks /Create /SC ONLOGON /RL LIMITED`. A non-admin terminal fails immediately with `ERROR: Access is denied.` Even when run as admin, the `.cmd` launcher still pops a visible cmd window whose closing also kills the listener, so it is not truly headless; and `/HIDE` is not a valid `schtasks` argument on current Windows 11, so that path is a dead end.
 
-A purely user-level, admin-free, hidden autostart: launch `run --skip-check-lark-cli` from a VBS script (`WScript.Shell.Run cmd, 0, False`, where `0` means a hidden window), and drop that VBS into the Startup folder so it launches hidden on login.
-
 1. Create the launcher, e.g. `%USERPROFILE%\.lark-channel\start-bridge-hidden.vbs`:
 
 ```vbs
@@ -337,12 +335,96 @@ node    = nodeDir & "\node.exe"
 bridge  = nodeDir & "\node_modules\lark-channel-bridge\bin\lark-channel-bridge.mjs"
 logFile = home & "\bridge-autostart.log"
 
-' None of the paths contain spaces, so no extra quoting is needed; style 0 = hidden window; False = do not wait for the child
+'---------- safe-restart: kill-old + wait + clear-stale-locks + start ----------
+' Handles all scenarios safely: no old process, dead process with orphan locks,
+' or live process (re-run while already running).
+'------------------------------------------------------------------------------
+
+' Step 1: kill any live bridge node process (taskkill /F /T = kill tree).
+' No-op if none are running.
+KillBridgeProcesses
+
+' Step 2: wait up to 15s (30 x 500ms) for the process tree to fully exit.
+Dim waitTries
+waitTries = 0
+Do While BridgeProcessRunning And waitTries < 30
+    WScript.Sleep 500
+    waitTries = waitTries + 1
+Loop
+WScript.Sleep 500
+
+' Step 3: once process is confirmed dead, clear orphaned runtime lock files.
+' Retry deletion up to 10x500ms because the OS may briefly hold file locks.
+If Not BridgeProcessRunning Then
+    On Error Resume Next
+    ClearStaleRuntimeLocksWithRetry home
+    On Error GoTo 0
+End If
+
+' Step 4: start the bridge hidden. style 0 = hidden window; False = do not wait.
 cmd = "cmd /c " & node & " " & bridge & " run --profile codex --skip-check-lark-cli >> " & logFile & " 2>&1"
 o.Run cmd, 0, False
+
+Sub KillBridgeProcesses
+    Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+    Set procs = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name='node.exe' AND CommandLine LIKE '%lark-channel%'")
+    For Each pr in procs
+        pid = pr.ProcessId
+        On Error Resume Next
+        o.Run "taskkill /F /T /PID " & pid, 0, True
+        On Error GoTo 0
+    Next
+End Sub
+
+Function BridgeProcessRunning
+    Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+    Set procs = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name='node.exe' AND CommandLine LIKE '%lark-channel%'")
+    BridgeProcessRunning = (procs.Count > 0)
+End Function
+
+Sub ClearStaleRuntimeLocksWithRetry(homeDir)
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    locks = fso.BuildPath(homeDir, "registry\locks")
+    If Not fso.FolderExists(locks) Then Exit Sub
+    Dim retries, done, pf, af
+    retries = 0
+    done = False
+    Do While Not done And retries < 10
+        pf = fso.BuildPath(locks, "profile")
+        af = fso.BuildPath(locks, "app")
+        On Error Resume Next
+        ' Delete all files + subfolders in profile/
+        If fso.FolderExists(pf) Then
+            fso.DeleteFile fso.BuildPath(pf, "*.*"), True
+            For Each sf In fso.GetFolder(pf).SubFolders
+                sf.Delete True
+            Next
+        End If
+        ' Delete all files + subfolders in app/
+        If fso.FolderExists(af) Then
+            fso.DeleteFile fso.BuildPath(af, "*.*"), True
+            For Each sf In fso.GetFolder(af).SubFolders
+                sf.Delete True
+            Next
+        End If
+        On Error GoTo 0
+        ' Verify both files AND subfolders are gone
+        If (Not fso.FolderExists(pf) Or _
+            (fso.GetFolder(pf).Files.Count = 0 And fso.GetFolder(pf).SubFolders.Count = 0)) _
+           And (Not fso.FolderExists(af) Or _
+            (fso.GetFolder(af).Files.Count = 0 And fso.GetFolder(af).SubFolders.Count = 0)) Then
+            done = True
+        Else
+            WScript.Sleep 500
+            retries = retries + 1
+        End If
+    Loop
+End Sub
 ```
 
 > Replace `--profile codex` with the profile you actually use (switch the active profile with `lark-channel-bridge profile use`). For first run, do `lark-channel-bridge run` once to finish the QR scan, then switch to this approach.
+>
+> This VBS implements safe-restart: it kills any old process (`taskkill /F /T /PID` kills the process tree), waits for full exit (up to 15s), clears orphaned lock files (`DeleteFile` + `DeleteFolder` for `.lock.lock` directories, retries up to 5s), then launches hidden. Whether the bridge is **not running**, **dead with orphaned locks**, or **already alive**, double-clicking the VBS is always safe.
 
 2. Put a shortcut to the VBS (or the VBS itself) in the Startup folder: `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`. The shortcut target should be `wscript.exe "C:\Users\<you>\.lark-channel\start-bridge-hidden.vbs"`.
 
@@ -352,9 +434,7 @@ o.Run cmd, 0, False
 
 **Disable the old ONLOGON task** (only if you previously registered one as admin): run `schtasks /Change /Disable /TN LarkChannelBridge.Bot.<profile>` in an admin terminal, or disable / delete it in Task Scheduler.
 
-**Note:** once you use the VBS approach, the `start` / `stop` / `status` service commands no longer manage this daemon. Check status with `/status` inside Feishu; logs are at `%USERPROFILE%\.lark-channel\bridge-autostart.log`. This approach shares the same `~/.lark-channel/config.json` as a foreground `run`.
-
-## Testing and CI
+**Note:** once you use the VBS approach, the `start` / `stop` / `status` service commands no longer manage this daemon. Check status with `/status` inside Feishu; logs are at `%USERPROFILE%\.lark-channel\bridge-autostart.log`. This approach shares the same `~/.lark-channel/config.json` as a foreground `run`. The VBS script (with full safe-restart logic) can be found in this repository at [`windows/start-bridge-hidden.vbs`](./windows/start-bridge-hidden.vbs).
 
 Local checks:
 

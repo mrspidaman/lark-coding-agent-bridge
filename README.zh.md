@@ -1,4 +1,4 @@
-# lark-channel-bridge
+﻿# lark-channel-bridge
 
 把飞书 / Lark 消息和本地 Claude Code 或 Codex CLI 打通的轻量 bot。用一条命令启动，扫码绑定 PersonalAgent 应用，然后在飞书里和本机编程助手对话，让它读图、处理文件、改代码。
 
@@ -312,8 +312,6 @@ grep '"event":"enter"' ~/.lark-channel/profiles/<profile>/logs/bridge-$(date +%Y
 **图片发过去 agent 说看不到**：升级到最新版，0.1.0 之前的版本有文件名去重 bug。
 **Windows 上 `start` 报 `ERROR: Access is denied.` / 如何隐藏窗口后台常驻**：`start` 在 Windows 上会通过 `schtasks /Create /SC ONLOGON /RL LIMITED` 注册"任务计划程序"任务；非管理员终端会直接失败（报错 `ERROR: Access is denied.`）。即便用管理员跑通，任务计划程序拉起的 `.cmd` 仍会弹出一个可见的 cmd 窗口，关掉窗口监听就被关掉，并不是纯后台；而且 `/HIDE` 在当前 Windows 11 上不是 `schtasks` 的合法参数，这条路走不通。
 
-纯用户级、免管理员、隐藏窗口的自启方案：用 VBS 脚本（`WScript.Shell.Run cmd, 0, False`，第 2 个参数为 `0` = 隐藏窗口）启动 `run --skip-check-lark-cli`，再把 VBS 放进启动文件夹，登录时自动隐藏运行。
-
 1. 新建启动器，例如 `%USERPROFILE%\.lark-channel\start-bridge-hidden.vbs`：
 
 ```vbs
@@ -337,12 +335,96 @@ node    = nodeDir & "\node.exe"
 bridge  = nodeDir & "\node_modules\lark-channel-bridge\bin\lark-channel-bridge.mjs"
 logFile = home & "\bridge-autostart.log"
 
-' 路径都不含空格，无需额外加引号；style 0 = 隐藏窗口；False = 不等子进程退出
+'---------- safe-restart: kill-old + wait + clear-stale-locks + start ----------
+' Handles all scenarios safely: no old process, dead process with orphan locks,
+' or live process (re-run while already running).
+'------------------------------------------------------------------------------
+
+' Step 1: kill any live bridge node process (taskkill /F /T = kill tree).
+' No-op if none are running.
+KillBridgeProcesses
+
+' Step 2: wait up to 15s (30 x 500ms) for the process tree to fully exit.
+Dim waitTries
+waitTries = 0
+Do While BridgeProcessRunning And waitTries < 30
+    WScript.Sleep 500
+    waitTries = waitTries + 1
+Loop
+WScript.Sleep 500
+
+' Step 3: once process is confirmed dead, clear orphaned runtime lock files.
+' Retry deletion up to 10x500ms because the OS may briefly hold file locks.
+If Not BridgeProcessRunning Then
+    On Error Resume Next
+    ClearStaleRuntimeLocksWithRetry home
+    On Error GoTo 0
+End If
+
+' Step 4: start the bridge hidden. style 0 = hidden window; False = do not wait.
 cmd = "cmd /c " & node & " " & bridge & " run --profile codex --skip-check-lark-cli >> " & logFile & " 2>&1"
 o.Run cmd, 0, False
+
+Sub KillBridgeProcesses
+    Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+    Set procs = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name='node.exe' AND CommandLine LIKE '%lark-channel%'")
+    For Each pr in procs
+        pid = pr.ProcessId
+        On Error Resume Next
+        o.Run "taskkill /F /T /PID " & pid, 0, True
+        On Error GoTo 0
+    Next
+End Sub
+
+Function BridgeProcessRunning
+    Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+    Set procs = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name='node.exe' AND CommandLine LIKE '%lark-channel%'")
+    BridgeProcessRunning = (procs.Count > 0)
+End Function
+
+Sub ClearStaleRuntimeLocksWithRetry(homeDir)
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    locks = fso.BuildPath(homeDir, "registry\locks")
+    If Not fso.FolderExists(locks) Then Exit Sub
+    Dim retries, done, pf, af
+    retries = 0
+    done = False
+    Do While Not done And retries < 10
+        pf = fso.BuildPath(locks, "profile")
+        af = fso.BuildPath(locks, "app")
+        On Error Resume Next
+        ' Delete all files + subfolders in profile/
+        If fso.FolderExists(pf) Then
+            fso.DeleteFile fso.BuildPath(pf, "*.*"), True
+            For Each sf In fso.GetFolder(pf).SubFolders
+                sf.Delete True
+            Next
+        End If
+        ' Delete all files + subfolders in app/
+        If fso.FolderExists(af) Then
+            fso.DeleteFile fso.BuildPath(af, "*.*"), True
+            For Each sf In fso.GetFolder(af).SubFolders
+                sf.Delete True
+            Next
+        End If
+        On Error GoTo 0
+        ' Verify both files AND subfolders are gone
+        If (Not fso.FolderExists(pf) Or _
+            (fso.GetFolder(pf).Files.Count = 0 And fso.GetFolder(pf).SubFolders.Count = 0)) _
+           And (Not fso.FolderExists(af) Or _
+            (fso.GetFolder(af).Files.Count = 0 And fso.GetFolder(af).SubFolders.Count = 0)) Then
+            done = True
+        Else
+            WScript.Sleep 500
+            retries = retries + 1
+        End If
+    Loop
+End Sub
 ```
 
 > `--profile codex` 换成你实际使用的 profile（默认激活的 profile 用 `lark-channel-bridge profile use` 切换）。若是首次启动，先跑一次 `lark-channel-bridge run` 完成扫码绑定，再改用本方案。
+>
+> 这个 VBS 实现了安全重启：每次启动前自动杀掉旧进程（`taskkill /F /T /PID` 杀进程树）、等待进程彻底退出（最多 15s）、清理残留的锁文件（`DeleteFile` + `DeleteFolder` 删 `.lock.lock` 目录，最多重试 5s），然后隐藏启动。无论当前 bridge 是**没在运行**、**死进程有残留锁**、还是**已经活着**，双击 VBS 永远是安全的。
 
 2. 在启动文件夹放一个指向该 VBS 的快捷方式（或把 VBS 直接放进去）。启动文件夹路径：`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`。快捷方式目标填 `wscript.exe "C:\Users\<你的用户名>\.lark-channel\start-bridge-hidden.vbs"`。
 
@@ -352,9 +434,7 @@ o.Run cmd, 0, False
 
 **停用旧的 ONLOGON 任务**（仅当你之前用管理员 `start` 成功注册过）：在管理员终端执行 `schtasks /Change /Disable /TN LarkChannelBridge.Bot.<profile>`，或在"任务计划程序"里手动禁用 / 删除。
 
-**注意**：改用 VBS 自启后，`start` / `stop` / `status` 这套服务命令不再管理这个 daemon；查看运行状态用飞书内 `/status`，日志在 `%USERPROFILE%\.lark-channel\bridge-autostart.log`。本方案和 `run` 前台用的是同一份 `~/.lark-channel/config.json` 配置。
-
-## 测试与 CI
+**注意**：改用 VBS 自启后，`start` / `stop` / `status` 这套服务命令不再管理这个 daemon；查看运行状态用飞书内 `/status`，日志在 `%USERPROFILE%\.lark-channel\bridge-autostart.log`。本方案和 `run` 前台用的是同一份 `~/.lark-channel/config.json` 配置。VBS 脚本（含完整安全重启逻辑）可在本仓库的 [`windows/start-bridge-hidden.vbs`](./windows/start-bridge-hidden.vbs) 找到。
 
 本地检查：
 
