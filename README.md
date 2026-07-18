@@ -439,6 +439,11 @@ End Sub
 Local checks:
 
 ```bash
+
+**bot withdraws a message before replying**: By default, bridge uses `replyMode: "markdown"`, which first sends a streaming card and then a separate markdown message. When the streaming card completes, the Feishu client triggers a card state transition (`streaming_mode: false`), which appears as a "withdraw" animation.
+
+Send **`/config messageReply card`** to the bot to switch to card mode — card mode updates the existing card in-place and does not produce a second message.
+
 pnpm test
 pnpm typecheck
 pnpm build

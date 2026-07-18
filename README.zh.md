@@ -436,6 +436,10 @@ End Sub
 
 **注意**：改用 VBS 自启后，`start` / `stop` / `status` 这套服务命令不再管理这个 daemon；查看运行状态用飞书内 `/status`，日志在 `%USERPROFILE%\.lark-channel\bridge-autostart.log`。本方案和 `run` 前台用的是同一份 `~/.lark-channel/config.json` 配置。VBS 脚本（含完整安全重启逻辑）可在本仓库的 [`windows/start-bridge-hidden.vbs`](./windows/start-bridge-hidden.vbs) 找到。
 
+**bot 回复时先撤回一条消息**：bridge 默认使用 `replyMode: "markdown"` 模式，先发一张流式卡片再发一条独立文本消息。流式卡片完成时，飞书客户端会触发卡片状态切换（`streaming_mode: false`），表现为一次"撤回"动画。
+
+给 bot 发 **`/config messageReply card`** 切换到卡片模式可消除此现象——卡片模式直接更新已有卡片，不产生第二条消息。
+
 本地检查：
 
 ```bash
